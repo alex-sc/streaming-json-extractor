@@ -1,12 +1,12 @@
 extern crate json_event_parser;
 extern crate log;
+extern crate qjsonrs;
 
-use std::alloc::System;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use json_event_parser::{FromReadJsonReader, JsonEvent};
+use qjsonrs::{JsonStream, JsonToken, JsonTokenIterator};
 
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub enum JsonValue {
@@ -19,22 +19,31 @@ pub enum JsonValue {
 }
 
 #[derive(Clone, Hash, Eq, PartialEq, Debug)]
-pub enum JsonEventOwned {
-    String(String),
-    Number(String),
-    Boolean(bool),
-    Null,
-    StartArray,
-    EndArray,
+pub enum JsonTokenOwned {
+    /// The start of an object, a.k.a. '{'
     StartObject,
+    /// The end of an object, a.k.a. '}'
     EndObject,
-    ObjectKey(String),
-    Eof,
+    /// The start of an array, a.k.a. '['
+    StartArray,
+    /// The end of an object, a.k.a. ']'
+    EndArray,
+    /// The token 'null'
+    JsNull,
+    /// Either 'true' or 'false'
+    JsBoolean(bool),
+    /// A number, unparsed. i.e. '-123.456e-789'
+    JsNumber(String),
+    /// A JSON string in a value context.
+    JsString(String),
+    /// A JSON string in the context of a key in a JSON object.
+    JsKey(String),
+    JsEof,
 }
 
 pub struct State {
-    parser: FromReadJsonReader<BufReader<File>>,
-    token: JsonEventOwned,
+    parser: JsonStream<BufReader<File>>,
+    token: JsonTokenOwned,
     cnt: i64,
     matches: i64,
     start: Duration
@@ -42,37 +51,37 @@ pub struct State {
 
 impl State {
 
-    pub fn new(parser: FromReadJsonReader<BufReader<File>>) -> State {
+    pub fn new(parser: JsonStream<BufReader<File>>) -> State {
         State {
             parser,
             start: SystemTime::now().duration_since(UNIX_EPOCH).unwrap(),
-            token: JsonEventOwned::Null, cnt: 0, matches: 0
+            token: JsonTokenOwned::JsNull, cnt: 0, matches: 0
         }
     }
 
     pub(crate) fn next_token(&mut self) {
         // Transform the borrowed `JsonEvent` into an owned version with a `'static` lifetime.
-        let next = self.parser.read_next_event().unwrap();
-        let owned_event = match next {
-            JsonEvent::String(value) => JsonEventOwned::String(value.to_string()),
-            JsonEvent::Number(value) => JsonEventOwned::Number(value.to_string()),
-            JsonEvent::Boolean(value) => JsonEventOwned::Boolean(value.to_owned()),
-            JsonEvent::Null => JsonEventOwned::Null,
-            JsonEvent::StartObject => JsonEventOwned::StartObject,
-            JsonEvent::EndObject => JsonEventOwned::EndObject,
-            JsonEvent::StartArray => JsonEventOwned::StartArray,
-            JsonEvent::EndArray => JsonEventOwned::EndArray,
-            JsonEvent::ObjectKey(value) => JsonEventOwned::ObjectKey(value.to_string()),
-            JsonEvent::Eof => JsonEventOwned::Eof,
+        let next = self.parser.next().unwrap();
+        if next.is_none() {
+            self.token = JsonTokenOwned::JsEof;
+            return;
+        }
+        let owned_event = match next.unwrap() {
+            JsonToken::JsString(value) => JsonTokenOwned::JsString(value.into()),
+            JsonToken::JsNumber(value) => JsonTokenOwned::JsNumber(value.to_string()),
+            JsonToken::JsBoolean(value) => JsonTokenOwned::JsBoolean(value.to_owned()),
+            JsonToken::JsNull => JsonTokenOwned::JsNull,
+            JsonToken::StartObject => JsonTokenOwned::StartObject,
+            JsonToken::EndObject => JsonTokenOwned::EndObject,
+            JsonToken::StartArray => JsonTokenOwned::StartArray,
+            JsonToken::EndArray => JsonTokenOwned::EndArray,
+            JsonToken::JsKey(value) => JsonTokenOwned::JsKey(value.into())
         };
         self.token = owned_event;
         self.cnt += 1;
         if self.cnt % 1_000_000 == 0 {
             let end = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
             println!("{} M in {} seconds, matches: {}", self.cnt / 1_000_000, end.as_secs() - self.start.as_secs(), self.matches)
-        }
-        if self.cnt > 1000 {
-            //panic!("")
         }
     }
 }
@@ -81,12 +90,12 @@ fn parse(state: &mut State, store: bool, array_level: i32) -> JsonValue {
     let token = state.token.clone();
     state.next_token();
     match token {
-        JsonEventOwned::StartObject => {
+        JsonTokenOwned::StartObject => {
             let mut map = HashMap::new();
             let mut is_match = false;
-            while state.token != JsonEventOwned::EndObject {
+            while state.token != JsonTokenOwned::EndObject {
                 match state.token.clone() {
-                    JsonEventOwned::ObjectKey(key) => {
+                    JsonTokenOwned::JsKey(key) => {
                         let field_name_value = key;
                         let store_new = store || "in_network" == field_name_value;
                         state.next_token();
@@ -110,9 +119,9 @@ fn parse(state: &mut State, store: bool, array_level: i32) -> JsonValue {
             state.next_token();
             JsonValue::Object(map)
         }
-        JsonEventOwned::StartArray => {
+        JsonTokenOwned::StartArray => {
             let mut arr = Vec::new();
-            while state.token != JsonEventOwned::EndArray {
+            while state.token != JsonTokenOwned::EndArray {
                 let obj = parse(state, store, array_level + 1);
                 if store && array_level > 0 {
                     arr.push(obj);
@@ -121,19 +130,20 @@ fn parse(state: &mut State, store: bool, array_level: i32) -> JsonValue {
             state.next_token();
             JsonValue::Array(arr)
         }
-        JsonEventOwned::String(value) => JsonValue::String(value),
-        JsonEventOwned::Number(value) => JsonValue::Number(value),
-        JsonEventOwned::Boolean(value) => JsonValue::Boolean(value),
-        JsonEventOwned::Null => JsonValue::Null,
+        JsonTokenOwned::JsString(value) => JsonValue::String(value),
+        JsonTokenOwned::JsNumber(value) => JsonValue::Number(value),
+        JsonTokenOwned::JsBoolean(value) => JsonValue::Boolean(value),
+        JsonTokenOwned::JsNull => JsonValue::Null,
         _ => panic!("Invalid state"),
     }
 }
 
 fn main() -> std::io::Result<()> {
     let file = File::open("./FloridaBlue_GBO_in-network-rates.json")?;
-    let reader = BufReader::new(file);
+    //let file = File::open("./layout.json")?;
+    let reader = BufReader::with_capacity(1024 * 1024, file);
 
-    let parser = FromReadJsonReader::new(reader);
+    let parser = JsonStream::from_read(reader, 1024 * 1024).unwrap();
     let start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 
     let mut state = State::new(parser);
