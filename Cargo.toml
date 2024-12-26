@@ -4,3 +4,10 @@ version = "1.0.0"
 
 [dependencies]
 json-event-parser = "0.2"
+log = "0.4.22"
+
+[profile.dev]
+opt-level = 3
+
+[profile.release]
+opt-level = 3

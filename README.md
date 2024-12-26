@@ -6,5 +6,5 @@
 |----------|-------------------|-------|---|---|---|
 | Python   | json-stream       | hours |   |   |   |
 | Java     | jackson           | 360s  |   |   |   |
-| Rust     | json_event_parser | ~hour |   |   |   |
+| Rust     | json_event_parser | 720s  |   |   |   |
 | Go       |                   |       |   |   |   |
