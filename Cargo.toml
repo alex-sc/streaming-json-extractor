@@ -1,0 +1,6 @@
+[package]
+name = "streaming-json-extractor"
+version = "1.0.0"
+
+[dependencies]
+json-event-parser = "0.2"
