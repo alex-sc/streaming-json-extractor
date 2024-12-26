@@ -1,13 +1,14 @@
 extern crate json_event_parser;
 extern crate log;
 
+use std::alloc::System;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::BufReader;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use json_event_parser::{FromReadJsonReader, JsonEvent};
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq, Clone)]
 pub enum JsonValue {
     Object(HashMap<String, JsonValue>), // A JSON object
     Array(Vec<JsonValue>),             // A JSON array
@@ -33,7 +34,7 @@ pub enum JsonEventOwned {
 
 pub struct State {
     parser: FromReadJsonReader<BufReader<File>>,
-    token: Option<JsonEventOwned>,
+    token: JsonEventOwned,
     cnt: i64,
     matches: i64,
     start: Duration
@@ -45,11 +46,11 @@ impl State {
         State {
             parser,
             start: SystemTime::now().duration_since(UNIX_EPOCH).unwrap(),
-            token: None, cnt: 0, matches: 0
+            token: JsonEventOwned::Null, cnt: 0, matches: 0
         }
     }
 
-    pub(crate) fn next_token(&mut self) -> JsonEventOwned {
+    pub(crate) fn next_token(&mut self) {
         // Transform the borrowed `JsonEvent` into an owned version with a `'static` lifetime.
         let next = self.parser.read_next_event().unwrap();
         let owned_event = match next {
@@ -64,48 +65,44 @@ impl State {
             JsonEvent::ObjectKey(value) => JsonEventOwned::ObjectKey(value.to_string()),
             JsonEvent::Eof => JsonEventOwned::Eof,
         };
-        self.token = Some(owned_event.clone());
+        self.token = owned_event;
         self.cnt += 1;
         if self.cnt % 1_000_000 == 0 {
             let end = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
             println!("{} M in {} seconds, matches: {}", self.cnt / 1_000_000, end.as_secs() - self.start.as_secs(), self.matches)
         }
-        owned_event
-    }
-
-    pub(crate) fn curr_token(&self) -> JsonEventOwned {
-        // Safely clone the current token, assuming it has been initialized.
-        self.token.clone().expect("No current token available")
+        if self.cnt > 1000 {
+            //panic!("")
+        }
     }
 }
 
-fn parse(state: &mut State, parent: Option<&str>, store: bool) -> JsonValue {
-    let token = match parent {
-        None => state.next_token(),
-        Some(_) => state.curr_token(),
-    };
+fn parse(state: &mut State, store: bool, array_level: i32) -> JsonValue {
+    let token = state.token.clone();
     state.next_token();
     match token {
         JsonEventOwned::StartObject => {
-            let mut store_new = store;
-            if parent.is_some() && !store_new {
-                store_new = "in_network" == parent.unwrap();
-            }
             let mut map = HashMap::new();
-            while state.curr_token() != JsonEventOwned::EndObject {
-                let field_name = state.curr_token();
-                match field_name {
+            let mut is_match = false;
+            while state.token != JsonEventOwned::EndObject {
+                match state.token.clone() {
                     JsonEventOwned::ObjectKey(key) => {
-                        let field_name_value = key.to_string().clone();
+                        let field_name_value = key;
+                        let store_new = store || "in_network" == field_name_value;
                         state.next_token();
-                        map.insert(field_name_value, parse(state, Some(&key), store_new));
+                        let field_value = parse(state, store_new, array_level);
+                        if "billing_code_type" == field_name_value {
+                            is_match |= JsonValue::String("CPT".parse().unwrap()) == field_value;
+                        }
+                        if store {
+                            map.insert(field_name_value, field_value);
+                        }
                     }
                     _ => panic!("Invalid state"),
                 }
             }
 
-            let value = &map.get("billing_code_type");
-            if value.is_some() && JsonValue::String("CPT".parse().unwrap()).eq(value.unwrap()) {
+            if is_match {
                 // println!("{:?}", map);
                 state.matches += 1;
             }
@@ -115,9 +112,9 @@ fn parse(state: &mut State, parent: Option<&str>, store: bool) -> JsonValue {
         }
         JsonEventOwned::StartArray => {
             let mut arr = Vec::new();
-            while state.curr_token() != JsonEventOwned::EndArray {
-                let obj = parse(state, parent, store);
-                if store {
+            while state.token != JsonEventOwned::EndArray {
+                let obj = parse(state, store, array_level + 1);
+                if store && array_level > 0 {
                     arr.push(obj);
                 }
             }
@@ -140,7 +137,8 @@ fn main() -> std::io::Result<()> {
     let start = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 
     let mut state = State::new(parser);
-    parse(&mut state, None, false);
+    state.next_token();
+    parse(&mut state, false, 0);
 
     let end = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
     println!("{} seconds", end.as_secs() - start.as_secs());
